@@ -23,3 +23,20 @@ fib(40)
 ```
 
 ## The Lexer
+
+## Implementing a Parser and AST
+
+```text
+$ ./toy
+ready> def foo(x y) x+foo(y, 4.0);
+ready> Parsed a function definition.
+ready> def foo(x y) x+y y;
+ready> Parsed a function definition.
+ready> Parsed a top-level expr.
+ready> def foo(x y) x+y );
+ready> Parsed a function definition.
+ready> Error: unknown token when expecting an expression
+ready> extern sin(a);
+ready> Parsed an extern.
+ready> ^D
+```
