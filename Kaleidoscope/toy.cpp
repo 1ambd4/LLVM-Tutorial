@@ -1,7 +1,14 @@
+#include "./KaleidoscopeJIT.h"
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <llvm/ADT/APFloat.h>
+#include <llvm/Analysis/CGSCCPassManager.h>
+#include <llvm/Analysis/LoopAnalysisManager.h>
+#include <llvm/ExecutionEngine/JITSymbol.h>
+#include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
+#include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/BasicBlock.h>
 #include <llvm/IR/ConstantFolder.h>
 #include <llvm/IR/Constants.h>
@@ -10,10 +17,20 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
+#include <llvm/IR/PassInstrumentation.h>
+#include <llvm/IR/PassManager.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/Passes/PassBuilder.h>
+#include <llvm/Passes/StandardInstrumentations.h>
+#include <llvm/Support/Error.h>
+#include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Transforms/InstCombine/InstCombine.h>
+#include <llvm/Transforms/Scalar/GVN.h>
+#include <llvm/Transforms/Scalar/Reassociate.h>
+#include <llvm/Transforms/Scalar/SimplifyCFG.h>
 #include <map>
 #include <memory>
 #include <string>
@@ -557,8 +574,39 @@ static std::unique_ptr<llvm::Module> TheModule;
 // in this map when generating code for their function body.
 static std::map<std::string, llvm::Value *> NamedValues;
 
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
+
+static std::unique_ptr<llvm::FunctionPassManager> TheFPM;
+static std::unique_ptr<llvm::LoopAnalysisManager> TheLAM;
+static std::unique_ptr<llvm::FunctionAnalysisManager> TheFAM;
+static std::unique_ptr<llvm::CGSCCAnalysisManager> TheCGAM;
+static std::unique_ptr<llvm::ModuleAnalysisManager> TheMAM;
+static std::unique_ptr<llvm::PassInstrumentationCallbacks> ThePIC;
+static std::unique_ptr<llvm::StandardInstrumentations> TheSI;
+
+static std::map<std::string, std::unique_ptr<PrototypeAST>> FunctionProtos;
+
+static llvm::ExitOnError ExitOnErr;
+
 llvm::Value *LogErrorV(const char *Str) {
   LogError(Str);
+  return nullptr;
+}
+
+llvm::Function *getFunction(std::string Name) {
+  // First, see if the function has already been added to the current module.
+  if (auto *F = TheModule->getFunction(Name)) {
+    return F;
+  }
+
+  // If not, check whether we can codegen the declaration from some existing
+  // prototype.
+  auto FI = FunctionProtos.find(Name);
+  if (FI != FunctionProtos.end()) {
+    return FI->second->codegen();
+  }
+
+  // If no existing prototype exists, return null.
   return nullptr;
 }
 
@@ -638,7 +686,9 @@ llvm::Value *BinaryExprAST::codegen() {
 // effort.
 llvm::Value *CallExprAST::codegen() {
   // Look up the name in the global module table.
-  llvm::Function *CalleeF = TheModule->getFunction(Callee);
+  // Notice: dont't call TheModule->getFunction(CalleeF) direct.
+  // llvm::Function *CalleeF = TheModule->getFunction(Callee);
+  llvm::Function *CalleeF = getFunction(Callee);
   if (!CalleeF) {
     return LogErrorV("unknown function referenced.");
   }
@@ -718,19 +768,14 @@ llvm::Function *PrototypeAST::codegen() {
 // incorrectly typed in before: if we didn't delete it, it would live in the
 // symbol table, with a body, preventing future redefinition.
 llvm::Function *FunctionAST::codegen() {
-  // First, check for an existing function from a previous 'extern' declaration.
-  llvm::Function *TheFunction = TheModule->getFunction(Proto->getName());
-
-  if (!TheFunction) {
-    TheFunction = Proto->codegen();
-  }
+  // Transfer ownership of the prototype to the FunctionProtos map, but keep a
+  // reference to it for use below.
+  auto &P = *Proto;
+  FunctionProtos[Proto->getName()] = std::move(Proto);
+  llvm::Function *TheFunction = getFunction(P.getName());
   if (!TheFunction) {
     return nullptr;
   }
-
-  // if (!TheFunction->empty()) {
-  //   return (llvm::Function *)LogErrorV("Function cannot be redefined.");
-  // }
 
   // Create a new basic block to start insertion into.
   llvm::BasicBlock *BB =
@@ -750,6 +795,11 @@ llvm::Function *FunctionAST::codegen() {
     // Validate the generated code, checking for consistency.
     // This function is defined in llvm/IR/Verifier.h
     verifyFunction(*TheFunction);
+
+    // Optimize the function.
+    // The FunctionPassManager optimizes and updates the LLVM Function* in
+    // place, improving (hopefully) its body.
+    TheFPM->run(*TheFunction, *TheFAM);
 
     return TheFunction;
   }
@@ -781,13 +831,42 @@ llvm::Function *FunctionAST::codegen() {
 // Top-Level parsing and JIT Driver
 //===----------------------------------------------------------------------===//
 
-static void InitializeModule() {
+static void InitializeModuleAndMangers() {
   // Open a new context and module.
   TheContext = std::make_unique<llvm::LLVMContext>();
   TheModule = std::make_unique<llvm::Module>("JIT", *TheContext);
+  TheModule->setDataLayout(TheJIT->getDataLayout());
 
   // Create a new builder for the module.
   Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
+
+  // Create new pass and analysis managers.
+  TheFPM = std::make_unique<llvm::FunctionPassManager>();
+  TheLAM = std::make_unique<llvm::LoopAnalysisManager>();
+  TheFAM = std::make_unique<llvm::FunctionAnalysisManager>();
+  TheCGAM = std::make_unique<llvm::CGSCCAnalysisManager>();
+  TheMAM = std::make_unique<llvm::ModuleAnalysisManager>();
+  ThePIC = std::make_unique<llvm::PassInstrumentationCallbacks>();
+  TheSI = std::make_unique<llvm::StandardInstrumentations>(
+      *TheContext, true); // true - enable DebugLogging
+
+  TheSI->registerCallbacks(*ThePIC, TheFAM.get());
+
+  // And transform passes.
+  // Do simple "peephole" optimizations and bit-twiddling optzns.
+  TheFPM->addPass(llvm::InstCombinePass());
+  // Reassociate expressions.
+  TheFPM->addPass(llvm::ReassociatePass());
+  // Eliminate Common SubExpressions.
+  TheFPM->addPass(llvm::GVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  TheFPM->addPass(llvm::SimplifyCFGPass());
+
+  // Register analysis passes used in these transform passes.
+  llvm::PassBuilder PB;
+  PB.registerModuleAnalyses(*TheMAM);
+  PB.registerFunctionAnalyses(*TheFAM);
+  PB.crossRegisterProxies(*TheLAM, *TheFAM, *TheCGAM, *TheMAM);
 }
 
 static void HandleDefinition() {
@@ -796,6 +875,9 @@ static void HandleDefinition() {
       fprintf(stderr, "Read function definition:\n");
       FnIR->print(llvm::errs());
       fprintf(stderr, "\n");
+      ExitOnErr(TheJIT->addModule(llvm::orc::ThreadSafeModule(
+          std::move(TheModule), std::move(TheContext))));
+      InitializeModuleAndMangers();
     }
   } else {
     // Skip token for error recovery.
@@ -809,6 +891,7 @@ static void HandleExtern() {
       fprintf(stderr, "Read extern:\n");
       FnIR->print(llvm::errs());
       fprintf(stderr, "\n");
+      FunctionProtos[ProtoAST->getName()] = std::move(ProtoAST);
     }
   } else {
     // Skip token for error recovery.
@@ -819,10 +902,30 @@ static void HandleExtern() {
 static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
   if (auto FnAST = ParseTopLevelExpr()) {
-    if (auto *FnIR = FnAST->codegen()) {
+    if (auto *FnIR = FnAST->codegen(); FnIR) {
       fprintf(stderr, "Read top level expression:\n");
       FnIR->print(llvm::errs());
       fprintf(stderr, "\n");
+
+      // Create a ResourceTracker to track JIT'd memory allocated to our
+      // anonymous expression -- that way we can free it after executing.
+      auto RT = TheJIT->getMainJITDylib().createResourceTracker();
+
+      auto TSM = llvm::orc::ThreadSafeModule(std::move(TheModule),
+                                             std::move(TheContext));
+      ExitOnErr(TheJIT->addModule(std::move(TSM), RT));
+      InitializeModuleAndMangers();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = ExitOnErr(TheJIT->lookup("__anon_expr"));
+
+      // Get the symbol's address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() = (double (*)())(intptr_t)ExprSymbol.getAddress();
+      fprintf(stderr, "Evaluated to %f\n", FP());
+
+      // Delete the anonymous expression module from the JIT.
+      ExitOnErr(RT->remove());
     }
   } else {
     // Skip token for error recovery.
@@ -864,14 +967,23 @@ static void MainLoop() {
 }
 
 int main() {
+  // Prepare the environment to create code for the current native target and
+  // declare and initialize the JIT. This is done by calling some
+  // InitializeNativeTarget\* functions and adding a global variable TheJIT.
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser();
+
   InitTokPrecedence();
 
   // Prime the first token.
   fprintf(stderr, "ready> ");
   getNextToken();
 
+  TheJIT = ExitOnErr(llvm::orc::KaleidoscopeJIT::Create());
+
   // Make the module, which holds all the code.
-  InitializeModule();
+  InitializeModuleAndMangers();
 
   // Run the main "interpreter loop" now.
   MainLoop();

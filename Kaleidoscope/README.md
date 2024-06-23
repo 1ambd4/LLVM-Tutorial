@@ -127,3 +127,85 @@ entry:
 
 declare double @cos(double)
 ```
+
+## Adding JIT and Optimizer Support
+
+LLVM provides many optimization passes, which do many different sorts of things and have different tradeoffs.
+
+For example, with two transformations: reassociation of expressions (to make the add’s lexically identical) and Common Subexpression Elimination (CSE), we can Optimize code like above.
+
+Before Optimize:
+
+```llvm
+ready> def test(x) (1+2+x)*(x+(1+2));
+ready> Read function definition:
+define double @test(double %x) {
+entry:
+  %AddTemp = fadd double 3.000000e+00, %x
+  %AddTemp1 = fadd double %x, 3.000000e+00
+  %MulTemp = fmul double %AddTemp, %AddTemp1
+  ret double %MulTemp
+}
+```
+
+After Optimize:
+
+```llvm
+ready> def test(x) (1+2+x)*(x+(1+2));
+ready> Read function definition:
+define double @test(double %x) {
+entry:
+  %AddTemp = fadd double %x, 3.000000e+00
+  %MulTemp = fmul double %AddTemp, %AddTemp
+  ret double %MulTemp
+}
+```
+
+Now that we have reasonable code coming out of our front-end, let’s talk about executing it!
+
+Here, we’ll add JIT compiler support to our interpreter. The basic idea that we want for Kaleidoscope is to have the user enter function bodies as they do now, but immediately evaluate the top-level expressions they type in. For example, if they type in “1 + 2;”, we should evaluate and print out 3. If they define a function, they should be able to call it from the command line.
+
+```llvm
+ready> 4+5;
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  ret double 9.000000e+00
+}
+
+Evaluated to 9.000000
+ready> def foo(x) x+1;
+ready> Read function definition:
+define double @foo(double %x) {
+entry:
+  %AddTemp = fadd double %x, 1.000000e+00
+  ret double %AddTemp
+}
+
+ready> foo(2023);
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  %CallTemp = call double @foo(double 2.023000e+03)
+  ret double %CallTemp
+}
+
+Evaluated to 2024.000000
+ready> extern cos(x);
+ready> Read extern:
+declare double @cos(double)
+
+ready> cos(37);
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  %CallTemp = call double @cos(double 3.700000e+01)
+  ret double 0x3FE87E459C20218C
+}
+
+Evaluated to 0.765414
+ready> ready> ^D
+; ModuleID = 'JIT'
+source_filename = "JIT"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+```

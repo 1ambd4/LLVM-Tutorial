@@ -1,5 +1,5 @@
 run: toy.cpp
-	clang++ -g -O3 toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core`
+	clang++ -g -O3 toy.cpp -rdynamic `llvm-config --cxxflags --ldflags --system-libs --libs core orcjit native`
 .PHONY: run
 
 clean:
