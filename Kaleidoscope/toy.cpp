@@ -1,6 +1,19 @@
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <llvm/ADT/APFloat.h>
+#include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/ConstantFolder.h>
+#include <llvm/IR/Constants.h>
+#include <llvm/IR/DerivedTypes.h>
+#include <llvm/IR/Function.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/Module.h>
+#include <llvm/IR/Type.h>
+#include <llvm/IR/Value.h>
+#include <llvm/IR/Verifier.h>
+#include <llvm/Support/raw_ostream.h>
 #include <map>
 #include <memory>
 #include <string>
@@ -22,7 +35,7 @@
 //  fib(40)
 
 // Here, we define know character [-256, -1],
-// for the purpose return the ASCII value of unknow character.
+// for the purpose return the ASCII value of unknown character.
 enum Token {
   tok_eof = -1,
 
@@ -113,12 +126,24 @@ namespace {
 class ExprAST {
 public:
   virtual ~ExprAST() = default;
+  // In order to generate LLVM IR, should define virtual code generation
+  // (codegen) methods in each AST class. The codegen() method says to emit IR
+  // for that AST node along with all the things it depends on, and they all
+  // return an LLVM Value object. "Value" is the class used to represent a
+  // "Static Single Assignment (SSA) register" or "SSA value" in LLVM.
+  //
+  // Note that instead of adding virtual methods to the ExprAST class hierarchy,
+  // it could also make sense to use a visitor pattern or some other way to
+  // model this. Again, this tutorial won’t dwell on good software engineering
+  // practices: for our purposes, adding a virtual method is simplest.
+  virtual llvm::Value *codegen() = 0;
 };
 
 // NumberExprAST - Expression class for numeric literals like "1.0".
 class NumberExprAST : public ExprAST {
 public:
   NumberExprAST(double Val) : Val(Val) {}
+  llvm::Value *codegen() override;
 
 private:
   double Val;
@@ -128,6 +153,7 @@ private:
 class VariableExprAST : public ExprAST {
 public:
   VariableExprAST(const std::string &Name) : Name(Name) {}
+  llvm::Value *codegen() override;
 
 private:
   std::string Name;
@@ -141,6 +167,7 @@ public:
   BinaryExprAST(char Op, std::unique_ptr<ExprAST> LHS,
                 std::unique_ptr<ExprAST> RHS)
       : Op(Op), LHS(std::move(LHS)), RHS(std::move(RHS)) {}
+  llvm::Value *codegen() override;
 
 private:
   char Op;
@@ -154,6 +181,7 @@ public:
   CallExprAST(const std::string &Callee,
               std::vector<std::unique_ptr<ExprAST>> Args)
       : Callee(Callee), Args(std::move(Args)) {}
+  llvm::Value *codegen() override;
 
 private:
   std::string Callee;
@@ -177,6 +205,8 @@ class PrototypeAST {
 public:
   PrototypeAST(const std::string &Name, std::vector<std::string> Args)
       : Name(Name), Args(std::move(Args)) {}
+  llvm::Function *codegen();
+  const std::string &getName() const { return Name; }
 
 private:
   std::string Name;
@@ -189,6 +219,7 @@ public:
   FunctionAST(std::unique_ptr<PrototypeAST> Proto,
               std::unique_ptr<ExprAST> Body)
       : Proto(std::move(Proto)), Body(std::move(Body)) {}
+  llvm::Function *codegen();
 
 private:
   std::unique_ptr<PrototypeAST> Proto;
@@ -498,12 +529,274 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 }
 
 //===----------------------------------------------------------------------===//
-// Top-Level parsing
+// Code Generation
 //===----------------------------------------------------------------------===//
 
+// TheContext is an opaque object that owns a lot of core LLVM data structures,
+// such as the type and constant value tables. We don’t need to understand it in
+// detail, we just need a single instance to pass into APIs that require it.
+//
+static std::unique_ptr<llvm::LLVMContext> TheContext;
+// static llvm::LLVMContext TheContext;
+// The Builder object is a helper object that makes it easy to generate LLVM
+// instructions. Instances of the IRBuilder class template keep track of the
+// current place to insert instructions and has methods to create new
+// instructions.
+//
+static std::unique_ptr<llvm::IRBuilder<>> Builder;
+// static llvm::IRBuilder<> Builder(TheContext);
+// TheModule is an LLVM construct that contains functions and global variables.
+// In many ways, it is the top-level structure that the LLVM IR uses to contain
+// code. It will own the memory for all of the IR that we generate, which is why
+// the codegen() method returns a raw Value*, rather than a unique_ptr<Value>.
+static std::unique_ptr<llvm::Module> TheModule;
+// The NamedValues map keeps track of which values are defined in the current
+// scope and what their LLVM representation is. (In other words, it is a symbol
+// table for the code). In this form of Kaleidoscope, the only things that can
+// be referenced are function parameters. As such, function parameters will be
+// in this map when generating code for their function body.
+static std::map<std::string, llvm::Value *> NamedValues;
+
+llvm::Value *LogErrorV(const char *Str) {
+  LogError(Str);
+  return nullptr;
+}
+
+// In the LLVM IR, numeric constants are represented with the ConstantFP class,
+// which holds the numeric value in an APFloat internally (APFloat has the
+// capability of holding floating point constants of Arbitrary Precision). This
+// code basically just creates and returns a ConstantFP. Note that in the LLVM
+// IR that constants are all uniqued together and shared. For this reason, the
+// API uses the "foo::get(…)" idiom instead of "new foo(..)" or
+// "foo::Create(..)".
+llvm::Value *NumberExprAST::codegen() {
+  return llvm::ConstantFP::get(*TheContext, llvm::APFloat(Val));
+}
+
+// References to variables are also quite simple using LLVM. In the simple
+// version of Kaleidoscope, we assume that the variable has already been emitted
+// somewhere and its value is available. In practice, the only values that can
+// be in the NamedValues map are function arguments. This code simply checks to
+// see that the specified name is in the map (if not, an unknown variable is
+// being referenced) and returns the value for it.
+llvm::Value *VariableExprAST::codegen() {
+  llvm::Value *V = NamedValues[Name];
+  if (!V) {
+    LogErrorV("Unknown variable name.");
+  }
+  return V;
+}
+
+// Binary operators start to get more interesting. The basic idea here is that
+// we recursively emit code for the left-hand side of the expression, then the
+// right-hand side, then we compute the result of the binary expression. In this
+// code, we do a simple switch on the opcode to create the right LLVM
+// instruction.
+// In the example above, the LLVM builder class is starting to show its value.
+// IRBuilder knows where to insert the newly created instruction, all you have
+// to do is specify what instruction to create (e.g. with CreateFAdd), which
+// operands to use (L and R here) and optionally provide a name for the
+// generated instruction.
+// One nice thing about LLVM is that the name is just a hint. For instance, if
+// the code above emits multiple “addtmp” variables, LLVM will automatically
+// provide each one with an increasing, unique numeric suffix. Local value names
+// for instructions are purely optional, but it makes it much easier to read the
+// IR dumps.
+llvm::Value *BinaryExprAST::codegen() {
+  llvm::Value *L = LHS->codegen();
+  llvm::Value *R = RHS->codegen();
+  if (!L || !R) {
+    return nullptr;
+  }
+
+  switch (Op) {
+  case '+':
+    return Builder->CreateFAdd(L, R, "AddTemp");
+  case '-':
+    return Builder->CreateFSub(L, R, "SubTemp");
+  case '*':
+    return Builder->CreateFMul(L, R, "MulTemp");
+  case '<':
+    L = Builder->CreateFCmpULT(L, R, "CMPTemp");
+    // Convert bool 0/1 to double 0.0 or 1.0
+    return Builder->CreateUIToFP(L, llvm::Type::getDoubleTy(*TheContext),
+                                 "BoolTemp");
+  default:
+    return LogErrorV("Invalid Binary Operator.");
+  }
+}
+
+// Code generation for function calls is quite straightforward with LLVM. The
+// code above initially does a function name lookup in the LLVM Module's symbol
+// table. Recall that the LLVM Module is the container that holds the functions
+// we are JIT'ing. By giving each function the same name as what the user
+// specifies, we can use the LLVM symbol table to resolve function names for us.
+// Once we have the function to call, we recursively codegen each argument that
+// is to be passed in, and create an LLVM call instruction. Note that LLVM uses
+// the native C calling conventions by default, allowing these calls to also
+// call into standard library functions like "sin" and "cos", with no additional
+// effort.
+llvm::Value *CallExprAST::codegen() {
+  // Look up the name in the global module table.
+  llvm::Function *CalleeF = TheModule->getFunction(Callee);
+  if (!CalleeF) {
+    return LogErrorV("unknown function referenced.");
+  }
+
+  // If arguments mismatch error.
+  if (CalleeF->arg_size() != Args.size()) {
+    return LogErrorV("Incorrect # arguments passed.");
+  }
+
+  std::vector<llvm::Value *> ArgsV;
+  for (unsigned i = 0, e = Args.size(); i != e; ++i) {
+    ArgsV.push_back(Args[i]->codegen());
+    if (!ArgsV.back()) {
+      return nullptr;
+    }
+  }
+  return Builder->CreateCall(CalleeF, ArgsV, "CallTemp");
+}
+
+// The call to FunctionType::get creates the FunctionType that should be used
+// for a given Prototype.
+// Then, Function::Create creates the IR Function corresponding to the
+// Prototype. This indicates the type, linkage and name to use, as well as which
+// module to insert into. "external linkage" means that the function may be
+// defined outside the current module and/or that it is callable by functions
+// outside the module.
+// Finally, we set the name of each of the function's arguments according to the
+// names given in the Prototype. This step isn't strictly necessary, but keeping
+// the names consistent makes the IR more readable, and allows subsequent code
+// to refer directly to the arguments for their names, rather than having to
+// look up them up in the Prototype AST.
+llvm::Function *PrototypeAST::codegen() {
+  // Make the function type: double(double, double) etc.
+  std::vector<llvm::Type *> Doubles(Args.size(),
+                                    llvm::Type::getDoubleTy(*TheContext));
+  llvm::FunctionType *FT = llvm::FunctionType::get(
+      llvm::Type::getDoubleTy(*TheContext), Doubles, false);
+  llvm::Function *F = llvm::Function::Create(
+      FT, llvm::Function::ExternalLinkage, Name, TheModule.get());
+
+  // Set name for all arguments.
+  unsigned Idx = 0;
+  for (auto &Arg : F->args()) {
+    Arg.setName(Args[Idx++]);
+  }
+
+  return F;
+}
+
+// At this point we have a function prototype with no body. This is how LLVM IR
+// represents function declarations. For extern statements in Kaleidoscope, this
+// is as far as we need to go. For function definitions however, we need to
+// codegen and attach a function body.
+//
+// For function definitions, we start by searching TheModule's symbol table for
+// an existing version of this function, in case one has already been created
+// using an 'extern' statement. If Module::getFunction returns null then no
+// previous version exists, so we'll codegen one from the Prototype. In either
+// case, we want to assert that the function is empty (i.e. has no body yet)
+// before we start.
+//
+// Once the insertion point has been set up and the NamedValues map populated,
+// we call the codegen() method for the root expression of the function. If no
+// error happens, this emits code to compute the expression into the entry block
+// and returns the value that was computed. Assuming no error, we then create an
+// LLVM ret instruction, which completes the function.
+//
+// Once the function is built, we call verifyFunction, which is provided by
+// LLVM. This function does a variety of consistency checks on the generated
+// code, to determine if our compiler is doing everything right. Using this is
+// important: it can catch a lot of bugs. Once the function is finished and
+// validated, we return it.
+//
+// The only piece left here is handling of the error case. For simplicity, we
+// handle this by merely deleting the function we produced with the
+// eraseFromParent method. This allows the user to redefine a function that they
+// incorrectly typed in before: if we didn't delete it, it would live in the
+// symbol table, with a body, preventing future redefinition.
+llvm::Function *FunctionAST::codegen() {
+  // First, check for an existing function from a previous 'extern' declaration.
+  llvm::Function *TheFunction = TheModule->getFunction(Proto->getName());
+
+  if (!TheFunction) {
+    TheFunction = Proto->codegen();
+  }
+  if (!TheFunction) {
+    return nullptr;
+  }
+
+  // if (!TheFunction->empty()) {
+  //   return (llvm::Function *)LogErrorV("Function cannot be redefined.");
+  // }
+
+  // Create a new basic block to start insertion into.
+  llvm::BasicBlock *BB =
+      llvm::BasicBlock::Create(*TheContext, "entry", TheFunction);
+  Builder->SetInsertPoint(BB);
+
+  // Record the function arguments in the NamedValues map.
+  NamedValues.clear();
+  for (auto &Arg : TheFunction->args()) {
+    NamedValues[std::string(Arg.getName())] = &Arg;
+  }
+
+  if (llvm::Value *RetVal = Body->codegen()) {
+    // Finish off the function.
+    Builder->CreateRet(RetVal);
+
+    // Validate the generated code, checking for consistency.
+    // This function is defined in llvm/IR/Verifier.h
+    verifyFunction(*TheFunction);
+
+    return TheFunction;
+  }
+
+  // Error reading body, remove function.
+  TheFunction->eraseFromParent();
+  return nullptr;
+}
+// Now we get to the point where the Builder is set up. The first line creates a
+// new basic block (named "entry"), which is inserted into TheFunction. The
+// second line then tells the builder that new instructions should be inserted
+// into the end of the new basic block. Basic blocks in LLVM are an important
+// part of functions that define the Control Flow Graph. Since we don’t have any
+// control flow, our functions will only contain one block at this point.
+
+// TODO
+// This code does have a bug, though: If the FunctionAST::codegen() method finds
+// an existing IR Function, it does not validate its signature against the
+// definition's own prototype. This means that an earlier ‘extern’ declaration
+// will take precedence over the function definition’s signature, which can
+// cause codegen to fail, for instance if the function arguments are named
+// differently. There are a number of ways to fix this bug, see what you can
+// come up with! Here is a testcase:
+// extern foo(a); # OK, defines foo.
+// def foo(b) b;  # Error: Unknown variable name. (decl using 'a' takes
+//                # precedence).
+
+//===----------------------------------------------------------------------===//
+// Top-Level parsing and JIT Driver
+//===----------------------------------------------------------------------===//
+
+static void InitializeModule() {
+  // Open a new context and module.
+  TheContext = std::make_unique<llvm::LLVMContext>();
+  TheModule = std::make_unique<llvm::Module>("JIT", *TheContext);
+
+  // Create a new builder for the module.
+  Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
+}
+
 static void HandleDefinition() {
-  if (ParseDefinition()) {
-    fprintf(stderr, "Parsed a function definition.\n");
+  if (auto FnAST = ParseDefinition()) {
+    if (auto *FnIR = FnAST->codegen()) {
+      fprintf(stderr, "Read function definition:\n");
+      FnIR->print(llvm::errs());
+      fprintf(stderr, "\n");
+    }
   } else {
     // Skip token for error recovery.
     getNextToken();
@@ -511,18 +804,28 @@ static void HandleDefinition() {
 }
 
 static void HandleExtern() {
-  if (ParseExtern()) {
-    fprintf(stderr, "Parsed an extern.\n");
+  if (auto ProtoAST = ParseExtern()) {
+    if (auto *FnIR = ProtoAST->codegen()) {
+      fprintf(stderr, "Read extern:\n");
+      FnIR->print(llvm::errs());
+      fprintf(stderr, "\n");
+    }
   } else {
+    // Skip token for error recovery.
     getNextToken();
   }
 }
 
 static void HandleTopLevelExpression() {
   // Evaluate a top-level expression into an anonymous function.
-  if (ParseTopLevelExpr()) {
-    fprintf(stderr, "Parsed a top-level expr.\n");
+  if (auto FnAST = ParseTopLevelExpr()) {
+    if (auto *FnIR = FnAST->codegen()) {
+      fprintf(stderr, "Read top level expression:\n");
+      FnIR->print(llvm::errs());
+      fprintf(stderr, "\n");
+    }
   } else {
+    // Skip token for error recovery.
     getNextToken();
   }
 }
@@ -567,8 +870,14 @@ int main() {
   fprintf(stderr, "ready> ");
   getNextToken();
 
+  // Make the module, which holds all the code.
+  InitializeModule();
+
   // Run the main "interpreter loop" now.
   MainLoop();
+
+  // Print out all of the generated code.
+  TheModule->print(llvm::errs(), nullptr);
 
   return 0;
 }

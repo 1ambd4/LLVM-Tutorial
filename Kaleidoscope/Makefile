@@ -1,5 +1,7 @@
 run: toy.cpp
-	clang++ -g -O3 toy.cpp -o toy
+	clang++ -g -O3 toy.cpp `llvm-config --cxxflags --ldflags --system-libs --libs core`
+.PHONY: run
 
 clean:
-	rm -rf ./toy
+	rm -rf ./a.out
+.PHONY: clean
