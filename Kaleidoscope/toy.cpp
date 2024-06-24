@@ -1,5 +1,6 @@
 #include "./KaleidoscopeJIT.h"
 #include <cctype>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -10,11 +11,13 @@
 #include <llvm/ExecutionEngine/Orc/Shared/ExecutorAddress.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
 #include <llvm/IR/BasicBlock.h>
+#include <llvm/IR/Constant.h>
 #include <llvm/IR/ConstantFolder.h>
 #include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassInstrumentation.h>
@@ -63,6 +66,14 @@ enum Token {
   // primary
   tok_identifier = -4,
   tok_number = -5,
+
+  // control
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
+
+  tok_for = -9,
+  tok_in = -10,
 };
 
 static std::string IdentifierStr; // Filled in if tok_identifier.
@@ -90,6 +101,21 @@ static int gettok() {
     }
     if (IdentifierStr == "extern") {
       return tok_extern;
+    }
+    if (IdentifierStr == "if") {
+      return tok_if;
+    }
+    if (IdentifierStr == "then") {
+      return tok_then;
+    }
+    if (IdentifierStr == "else") {
+      return tok_else;
+    }
+    if (IdentifierStr == "for") {
+      return tok_for;
+    }
+    if (IdentifierStr == "in") {
+      return tok_in;
     }
     return tok_identifier;
   }
@@ -203,6 +229,38 @@ public:
 private:
   std::string Callee;
   std::vector<std::unique_ptr<ExprAST>> Args;
+};
+
+// IfExprAST - Expression class for if/then/else.
+class IfExprAST : public ExprAST {
+public:
+  IfExprAST(std::unique_ptr<ExprAST> Cond, std::unique_ptr<ExprAST> Then,
+            std::unique_ptr<ExprAST> Else)
+      : Cond(std::move(Cond)), Then(std::move(Then)), Else(std::move(Else)) {}
+  llvm::Value *codegen() override;
+
+private:
+  std::unique_ptr<ExprAST> Cond;
+  std::unique_ptr<ExprAST> Then;
+  std::unique_ptr<ExprAST> Else;
+};
+
+// ForExpAST - Expression class for for/in.
+class ForExprAST : public ExprAST {
+public:
+  ForExprAST(const std::string &VarName, std::unique_ptr<ExprAST> Start,
+             std::unique_ptr<ExprAST> End, std::unique_ptr<ExprAST> Step,
+             std::unique_ptr<ExprAST> Body)
+      : VarName(VarName), Start(std::move(Start)), End(std::move(End)),
+        Step(std::move(Step)), Body(std::move(Body)) {}
+  llvm::Value *codegen() override;
+
+private:
+  std::string VarName;
+  std::unique_ptr<ExprAST> Start;
+  std::unique_ptr<ExprAST> End;
+  std::unique_ptr<ExprAST> Step;
+  std::unique_ptr<ExprAST> Body;
 };
 
 // For our basic language, these are all of the expression nodes we'll define.
@@ -351,15 +409,18 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
   return std::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 
+static std::unique_ptr<ExprAST> ParseIfExpr();
+static std::unique_ptr<ExprAST> ParseForExpr();
+
 // Now that we have all of our simple expression-parsing logic in place,
 // we can define a helper function to wrap it together into one entry point.
-// In order to parse an arbitrary primary expression, we need to determine what
-// sort of expression it is.
+// In order to parse an arbitrary primary expression, we need to determine
+// what sort of expression it is.
 //
 // Now that you see the definition of this function, it is more obvious why we
-// can assume the state of CurTok in the various functions. This uses look-ahead
-// to determine which sort of expression is being inspected, and then parses it
-// with a function call.
+// can assume the state of CurTok in the various functions. This uses
+// look-ahead to determine which sort of expression is being inspected, and
+// then parses it with a function call.
 //
 // primary
 //   ::= identifier
@@ -371,6 +432,10 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
     return ParseIdentifierExpr();
   case tok_number:
     return ParseNumberExpr();
+  case tok_if:
+    return ParseIfExpr();
+  case tok_for:
+    return ParseForExpr();
   case '(':
     return ParseParenExpr();
   default:
@@ -477,6 +542,113 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
   }
 }
 
+// If Syntax:
+// def fib(x)
+//   if x < 3 then
+//     1
+//   else
+//     fib(x-1) + fib(x-2)
+//
+// ifexpr
+//   ::= 'if' expression 'then' expression 'else' expression
+static std::unique_ptr<ExprAST> ParseIfExpr() {
+  getNextToken(); // eat the 'if'.
+
+  // condition.
+  auto Cond = ParseExpression();
+  if (!Cond) {
+    return nullptr;
+  }
+
+  if (CurTok != tok_then) {
+    return LogError("expected THEN");
+  }
+  getNextToken(); // eat the 'then'.
+
+  auto Then = ParseExpression();
+  if (!Then) {
+    return nullptr;
+  }
+
+  if (CurTok != tok_else) {
+    return LogError("expected ");
+  }
+  getNextToken(); // eat the 'else'.
+
+  auto Else = ParseExpression();
+  if (!Else) {
+    return nullptr;
+  }
+
+  return std::make_unique<IfExprAST>(std::move(Cond), std::move(Then),
+                                     std::move(Else));
+}
+
+// For Syntax:
+// def bar(n)
+//     for i = 1, i < n, 1.0 in
+//         putchar(42);
+//
+// forexpr
+//   ::= 'for' identifier '=' expr ',' expr (',' expr)? 'in' expr
+//
+// The parser code is also fairly standard. The only interesting thing here is
+// handling of the optional step value. The parser code handles it by checking
+// to see if the second comma is present. If not, it sets the step value to
+// null in the AST node.
+static std::unique_ptr<ExprAST> ParseForExpr() {
+  getNextToken(); // eat the 'for'
+
+  if (CurTok != tok_identifier) {
+    return LogError("expected identifier after for");
+  }
+
+  std::string IdName = IdentifierStr;
+  getNextToken(); // eat identifier
+
+  if (CurTok != '=') {
+    return LogError("expected '=' after for");
+  }
+  getNextToken(); // eat '='
+
+  auto Start = ParseExpression();
+  if (!Start) {
+    return nullptr;
+  }
+  if (CurTok != ',') {
+    return LogError("expected ',' after for start value");
+  }
+  getNextToken(); // eat ','
+
+  auto End = ParseExpression();
+  if (!End) {
+    return nullptr;
+  }
+
+  // The step value is optional.
+  std::unique_ptr<ExprAST> Step;
+  if (CurTok == ',') {
+    getNextToken(); // eat ','
+    Step = ParseExpression();
+    if (!Step) {
+      return nullptr;
+    }
+  }
+
+  if (CurTok != tok_in) {
+    return LogError("expected 'in' after for");
+  }
+  getNextToken(); // eat 'in'
+
+  auto Body = ParseExpression();
+  if (!Body) {
+    return nullptr;
+  }
+
+  return std::make_unique<ForExprAST>(IdName, std::move(Start), std::move(End),
+                                      std::move(Step), std::move(Body));
+}
+
 // The next thing missing is handling of function prototypes. In Kaleidoscope,
 // these are used both for 'extern' function declarations as well as function
 // body definitions.
@@ -549,9 +721,10 @@ static std::unique_ptr<FunctionAST> ParseTopLevelExpr() {
 // Code Generation
 //===----------------------------------------------------------------------===//
 
-// TheContext is an opaque object that owns a lot of core LLVM data structures,
-// such as the type and constant value tables. We don’t need to understand it in
-// detail, we just need a single instance to pass into APIs that require it.
+// TheContext is an opaque object that owns a lot of core LLVM data
+// structures, such as the type and constant value tables. We don’t need to
+// understand it in detail, we just need a single instance to pass into APIs
+// that require it.
 //
 static std::unique_ptr<llvm::LLVMContext> TheContext;
 // static llvm::LLVMContext TheContext;
@@ -562,16 +735,18 @@ static std::unique_ptr<llvm::LLVMContext> TheContext;
 //
 static std::unique_ptr<llvm::IRBuilder<>> Builder;
 // static llvm::IRBuilder<> Builder(TheContext);
-// TheModule is an LLVM construct that contains functions and global variables.
-// In many ways, it is the top-level structure that the LLVM IR uses to contain
-// code. It will own the memory for all of the IR that we generate, which is why
-// the codegen() method returns a raw Value*, rather than a unique_ptr<Value>.
+// TheModule is an LLVM construct that contains functions and global
+// variables. In many ways, it is the top-level structure that the LLVM IR
+// uses to contain code. It will own the memory for all of the IR that we
+// generate, which is why the codegen() method returns a raw Value*, rather
+// than a unique_ptr<Value>.
 static std::unique_ptr<llvm::Module> TheModule;
 // The NamedValues map keeps track of which values are defined in the current
-// scope and what their LLVM representation is. (In other words, it is a symbol
-// table for the code). In this form of Kaleidoscope, the only things that can
-// be referenced are function parameters. As such, function parameters will be
-// in this map when generating code for their function body.
+// scope and what their LLVM representation is. (In other words, it is a
+// symbol table for the code). In this form of Kaleidoscope, the only things
+// that can be referenced are function parameters. As such, function
+// parameters will be in this map when generating code for their function
+// body.
 static std::map<std::string, llvm::Value *> NamedValues;
 
 static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
@@ -610,23 +785,23 @@ llvm::Function *getFunction(std::string Name) {
   return nullptr;
 }
 
-// In the LLVM IR, numeric constants are represented with the ConstantFP class,
-// which holds the numeric value in an APFloat internally (APFloat has the
-// capability of holding floating point constants of Arbitrary Precision). This
-// code basically just creates and returns a ConstantFP. Note that in the LLVM
-// IR that constants are all uniqued together and shared. For this reason, the
-// API uses the "foo::get(…)" idiom instead of "new foo(..)" or
+// In the LLVM IR, numeric constants are represented with the ConstantFP
+// class, which holds the numeric value in an APFloat internally (APFloat has
+// the capability of holding floating point constants of Arbitrary Precision).
+// This code basically just creates and returns a ConstantFP. Note that in the
+// LLVM IR that constants are all uniqued together and shared. For this
+// reason, the API uses the "foo::get(…)" idiom instead of "new foo(..)" or
 // "foo::Create(..)".
 llvm::Value *NumberExprAST::codegen() {
   return llvm::ConstantFP::get(*TheContext, llvm::APFloat(Val));
 }
 
 // References to variables are also quite simple using LLVM. In the simple
-// version of Kaleidoscope, we assume that the variable has already been emitted
-// somewhere and its value is available. In practice, the only values that can
-// be in the NamedValues map are function arguments. This code simply checks to
-// see that the specified name is in the map (if not, an unknown variable is
-// being referenced) and returns the value for it.
+// version of Kaleidoscope, we assume that the variable has already been
+// emitted somewhere and its value is available. In practice, the only values
+// that can be in the NamedValues map are function arguments. This code simply
+// checks to see that the specified name is in the map (if not, an unknown
+// variable is being referenced) and returns the value for it.
 llvm::Value *VariableExprAST::codegen() {
   llvm::Value *V = NamedValues[Name];
   if (!V) {
@@ -635,20 +810,165 @@ llvm::Value *VariableExprAST::codegen() {
   return V;
 }
 
-// Binary operators start to get more interesting. The basic idea here is that
-// we recursively emit code for the left-hand side of the expression, then the
-// right-hand side, then we compute the result of the binary expression. In this
-// code, we do a simple switch on the opcode to create the right LLVM
-// instruction.
-// In the example above, the LLVM builder class is starting to show its value.
-// IRBuilder knows where to insert the newly created instruction, all you have
-// to do is specify what instruction to create (e.g. with CreateFAdd), which
-// operands to use (L and R here) and optionally provide a name for the
-// generated instruction.
-// One nice thing about LLVM is that the name is just a hint. For instance, if
-// the code above emits multiple “addtmp” variables, LLVM will automatically
-// provide each one with an increasing, unique numeric suffix. Local value names
-// for instructions are purely optional, but it makes it much easier to read the
+llvm::Value *IfExprAST::codegen() {
+  llvm::Value *CondV = Cond->codegen();
+  if (!CondV) {
+    return nullptr;
+  }
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  CondV = Builder->CreateFCmpONE(
+      CondV, llvm::ConstantFP::get(*TheContext, llvm::APFloat(0.0)), "ifcond");
+
+  llvm::Function *TheFunction = Builder->GetInsertBlock()->getParent();
+
+  // Create blocks for the then and else cases.  Insert the 'then' block at
+  // the end of the function.
+  llvm::BasicBlock *ThenBB =
+      llvm::BasicBlock::Create(*TheContext, "then", TheFunction);
+  llvm::BasicBlock *ElseBB = llvm::BasicBlock::Create(*TheContext, "else");
+  llvm::BasicBlock *MergeBB = llvm::BasicBlock::Create(*TheContext, "ifcont");
+
+  Builder->CreateCondBr(CondV, ThenBB, ElseBB);
+
+  // Emit then value.
+  Builder->SetInsertPoint(ThenBB);
+
+  llvm::Value *ThenV = Then->codegen();
+  if (!ThenV) {
+    return nullptr;
+  }
+
+  Builder->CreateBr(MergeBB);
+  // Codegen of 'Then' can change the current block, update ThenBB for the
+  // PHI.
+  ThenBB = Builder->GetInsertBlock();
+
+  // Emit else block.
+  TheFunction->insert(TheFunction->end(), ElseBB);
+  Builder->SetInsertPoint(ElseBB);
+
+  llvm::Value *ElseV = Else->codegen();
+  if (!ElseV) {
+    return nullptr;
+  }
+
+  Builder->CreateBr(MergeBB);
+  // Codegen of 'Else' can change the current block, update ElseBB for the
+  // PHI.
+  ElseBB = Builder->GetInsertBlock();
+
+  // Emit merge block.
+  TheFunction->insert(TheFunction->end(), MergeBB);
+  Builder->SetInsertPoint(MergeBB);
+  llvm::PHINode *PN =
+      Builder->CreatePHI(llvm::Type::getDoubleTy(*TheContext), 2, "IfTemp");
+
+  PN->addIncoming(ThenV, ThenBB);
+  PN->addIncoming(ElseV, ElseBB);
+  return PN;
+}
+
+llvm::Value *ForExprAST::codegen() {
+  // Emit the start code first, without 'variable' in scope.
+  llvm::Value *StartVal = Start->codegen();
+  if (!StartVal) {
+    return nullptr;
+  }
+
+  // Make the new basic block for the loop header, inserting after current
+  // block.
+  llvm::Function *TheFunction = Builder->GetInsertBlock()->getParent();
+  llvm::BasicBlock *PreheaderBB = Builder->GetInsertBlock();
+  llvm::BasicBlock *LoopBB =
+      llvm::BasicBlock::Create(*TheContext, "Loop", TheFunction);
+
+  // Insert an explicit fall through from the current block to the LoopBB.
+  Builder->CreateBr(LoopBB);
+
+  // Start insertion in LoopBB.
+  Builder->SetInsertPoint(LoopBB);
+
+  // Start the PHI node with an entry for Start.
+  llvm::PHINode *Variable =
+      Builder->CreatePHI(llvm::Type::getDoubleTy(*TheContext), 2, VarName);
+  Variable->addIncoming(StartVal, PreheaderBB);
+
+  // Within the loop, the variable is defined equal to the PHI node. If it
+  // shadows an existing variable, we have to restore it, so save it now.
+  llvm::Value *OldVal = NamedValues[VarName];
+  NamedValues[VarName] = Variable;
+
+  // Emit the body of the loop. This, like any other expr, can change the
+  // current BB. Note that we ignore the value computed by the body, but don't
+  // allow an error.
+  if (!Body->codegen()) {
+    return nullptr;
+  }
+
+  // Emit the step value.
+  llvm::Value *StepVal = nullptr;
+  if (Step) {
+    StepVal = Step->codegen();
+    if (!StepVal) {
+      return nullptr;
+    }
+  } else {
+    // If step not specified, use 1.0 as default.
+    StepVal = llvm::ConstantFP::get(*TheContext, llvm::APFloat(1.0));
+  }
+
+  llvm::Value *NextVal = Builder->CreateFAdd(Variable, StepVal, "nextval");
+
+  // Compute the end condition.
+  llvm::Value *EndCond = End->codegen();
+  if (!EndCond) {
+    return nullptr;
+  }
+
+  // Convert condition to a bool by comparing non-equal to 0.0.
+  EndCond = Builder->CreateFCmpONE(
+      EndCond, llvm::ConstantFP::get(*TheContext, llvm::APFloat(0.0)),
+      "loopcond");
+
+  // Create the "after loop" block and insert it.
+  llvm::BasicBlock *LoopEndBB = Builder->GetInsertBlock();
+  llvm::BasicBlock *AfterBB =
+      llvm::BasicBlock::Create(*TheContext, "afterloop", TheFunction);
+
+  // Insert the conditional branch into the end of LoopEndBB.
+  Builder->CreateCondBr(EndCond, LoopBB, AfterBB);
+
+  // Any new code will be inserted in AfterBB.
+  Builder->SetInsertPoint(AfterBB);
+
+  // And a new entry to the PHI node for the backedge.
+  Variable->addIncoming(NextVal, LoopEndBB);
+
+  // Restore the unshadowed variable.
+  if (OldVal) {
+    NamedValues[VarName] = OldVal;
+  } else {
+    NamedValues.erase(VarName);
+  }
+
+  // for expr always return 0.0.
+  return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(*TheContext));
+}
+
+// Binarkjy operators start to get more interesting. The basic idea here is
+// that we recursively emit code for the left-hand side of the expression,
+// then the right-hand side, then we compute the result of the binary
+// expression. In this code, we do a simple switch on the opcode to create the
+// right LLVM instruction. In the example above, the LLVM builder class is
+// starting to show its value. IRBuilder knows where to insert the newly
+// created instruction, all you have to do is specify what instruction to
+// create (e.g. with CreateFAdd), which operands to use (L and R here) and
+// optionally provide a name for the generated instruction. One nice thing
+// about LLVM is that the name is just a hint. For instance, if the code above
+// emits multiple “addtmp” variables, LLVM will automatically provide each one
+// with an increasing, unique numeric suffix. Local value names for
+// instructions are purely optional, but it makes it much easier to read the
 // IR dumps.
 llvm::Value *BinaryExprAST::codegen() {
   llvm::Value *L = LHS->codegen();
@@ -675,15 +995,15 @@ llvm::Value *BinaryExprAST::codegen() {
 }
 
 // Code generation for function calls is quite straightforward with LLVM. The
-// code above initially does a function name lookup in the LLVM Module's symbol
-// table. Recall that the LLVM Module is the container that holds the functions
-// we are JIT'ing. By giving each function the same name as what the user
-// specifies, we can use the LLVM symbol table to resolve function names for us.
-// Once we have the function to call, we recursively codegen each argument that
-// is to be passed in, and create an LLVM call instruction. Note that LLVM uses
-// the native C calling conventions by default, allowing these calls to also
-// call into standard library functions like "sin" and "cos", with no additional
-// effort.
+// code above initially does a function name lookup in the LLVM Module's
+// symbol table. Recall that the LLVM Module is the container that holds the
+// functions we are JIT'ing. By giving each function the same name as what the
+// user specifies, we can use the LLVM symbol table to resolve function names
+// for us. Once we have the function to call, we recursively codegen each
+// argument that is to be passed in, and create an LLVM call instruction. Note
+// that LLVM uses the native C calling conventions by default, allowing these
+// calls to also call into standard library functions like "sin" and "cos",
+// with no additional effort.
 llvm::Value *CallExprAST::codegen() {
   // Look up the name in the global module table.
   // Notice: dont't call TheModule->getFunction(CalleeF) direct.
@@ -711,15 +1031,15 @@ llvm::Value *CallExprAST::codegen() {
 // The call to FunctionType::get creates the FunctionType that should be used
 // for a given Prototype.
 // Then, Function::Create creates the IR Function corresponding to the
-// Prototype. This indicates the type, linkage and name to use, as well as which
-// module to insert into. "external linkage" means that the function may be
-// defined outside the current module and/or that it is callable by functions
-// outside the module.
-// Finally, we set the name of each of the function's arguments according to the
-// names given in the Prototype. This step isn't strictly necessary, but keeping
-// the names consistent makes the IR more readable, and allows subsequent code
-// to refer directly to the arguments for their names, rather than having to
-// look up them up in the Prototype AST.
+// Prototype. This indicates the type, linkage and name to use, as well as
+// which module to insert into. "external linkage" means that the function may
+// be defined outside the current module and/or that it is callable by
+// functions outside the module. Finally, we set the name of each of the
+// function's arguments according to the names given in the Prototype. This
+// step isn't strictly necessary, but keeping the names consistent makes the
+// IR more readable, and allows subsequent code to refer directly to the
+// arguments for their names, rather than having to look up them up in the
+// Prototype AST.
 llvm::Function *PrototypeAST::codegen() {
   // Make the function type: double(double, double) etc.
   std::vector<llvm::Type *> Doubles(Args.size(),
@@ -738,23 +1058,23 @@ llvm::Function *PrototypeAST::codegen() {
   return F;
 }
 
-// At this point we have a function prototype with no body. This is how LLVM IR
-// represents function declarations. For extern statements in Kaleidoscope, this
-// is as far as we need to go. For function definitions however, we need to
-// codegen and attach a function body.
+// At this point we have a function prototype with no body. This is how LLVM
+// IR represents function declarations. For extern statements in Kaleidoscope,
+// this is as far as we need to go. For function definitions however, we need
+// to codegen and attach a function body.
 //
-// For function definitions, we start by searching TheModule's symbol table for
-// an existing version of this function, in case one has already been created
-// using an 'extern' statement. If Module::getFunction returns null then no
-// previous version exists, so we'll codegen one from the Prototype. In either
-// case, we want to assert that the function is empty (i.e. has no body yet)
-// before we start.
+// For function definitions, we start by searching TheModule's symbol table
+// for an existing version of this function, in case one has already been
+// created using an 'extern' statement. If Module::getFunction returns null
+// then no previous version exists, so we'll codegen one from the Prototype.
+// In either case, we want to assert that the function is empty (i.e. has no
+// body yet) before we start.
 //
 // Once the insertion point has been set up and the NamedValues map populated,
 // we call the codegen() method for the root expression of the function. If no
-// error happens, this emits code to compute the expression into the entry block
-// and returns the value that was computed. Assuming no error, we then create an
-// LLVM ret instruction, which completes the function.
+// error happens, this emits code to compute the expression into the entry
+// block and returns the value that was computed. Assuming no error, we then
+// create an LLVM ret instruction, which completes the function.
 //
 // Once the function is built, we call verifyFunction, which is provided by
 // LLVM. This function does a variety of consistency checks on the generated
@@ -764,9 +1084,9 @@ llvm::Function *PrototypeAST::codegen() {
 //
 // The only piece left here is handling of the error case. For simplicity, we
 // handle this by merely deleting the function we produced with the
-// eraseFromParent method. This allows the user to redefine a function that they
-// incorrectly typed in before: if we didn't delete it, it would live in the
-// symbol table, with a body, preventing future redefinition.
+// eraseFromParent method. This allows the user to redefine a function that
+// they incorrectly typed in before: if we didn't delete it, it would live in
+// the symbol table, with a body, preventing future redefinition.
 llvm::Function *FunctionAST::codegen() {
   // Transfer ownership of the prototype to the FunctionProtos map, but keep a
   // reference to it for use below.
@@ -808,23 +1128,23 @@ llvm::Function *FunctionAST::codegen() {
   TheFunction->eraseFromParent();
   return nullptr;
 }
-// Now we get to the point where the Builder is set up. The first line creates a
-// new basic block (named "entry"), which is inserted into TheFunction. The
+// Now we get to the point where the Builder is set up. The first line creates
+// a new basic block (named "entry"), which is inserted into TheFunction. The
 // second line then tells the builder that new instructions should be inserted
 // into the end of the new basic block. Basic blocks in LLVM are an important
-// part of functions that define the Control Flow Graph. Since we don’t have any
-// control flow, our functions will only contain one block at this point.
+// part of functions that define the Control Flow Graph. Since we don’t have
+// any control flow, our functions will only contain one block at this point.
 
 // TODO
-// This code does have a bug, though: If the FunctionAST::codegen() method finds
-// an existing IR Function, it does not validate its signature against the
-// definition's own prototype. This means that an earlier ‘extern’ declaration
-// will take precedence over the function definition’s signature, which can
-// cause codegen to fail, for instance if the function arguments are named
-// differently. There are a number of ways to fix this bug, see what you can
-// come up with! Here is a testcase:
-// extern foo(a); # OK, defines foo.
-// def foo(b) b;  # Error: Unknown variable name. (decl using 'a' takes
+// This code does have a bug, though: If the FunctionAST::codegen() method
+// finds an existing IR Function, it does not validate its signature against
+// the definition's own prototype. This means that an earlier ‘extern’
+// declaration will take precedence over the function definition’s signature,
+// which can cause codegen to fail, for instance if the function arguments are
+// named differently. There are a number of ways to fix this bug, see what you
+// can come up with! Here is a testcase:
+// extern foo(a); # OK, defines foo. def
+// foo(b) b;      # Error: Unknown variable name. (decl using 'a' takes
 //                # precedence).
 
 //===----------------------------------------------------------------------===//
@@ -965,6 +1285,45 @@ static void MainLoop() {
     }
   }
 }
+
+//===----------------------------------------------------------------------===//
+// "Library" functions that can be "extern'd" from user code.
+//===----------------------------------------------------------------------===//
+
+// How does the JIT know about sin and cos? The answer is surprisingly simple:
+// The KaleidoscopeJIT has a straightforward symbol resolution rule that it uses
+// to find symbols that aren't available in any given module: First it searches
+// all the modules that have already been added to the JIT, from the most recent
+// to the oldest, to find the newest definition. If no definition is found
+// inside the JIT, it falls back to calling "dlsym("sin")" on the Kaleidoscope
+// process itself. Since "sin" is defined within the JIT's address space, it
+// simply patches up calls in the module to call the libm version of sin
+// directly. But in some cases this even goes further: as sin and cos are names
+// of standard math functions, the constant folder will directly evaluate the
+// function calls to the correct result when called with constants like in the
+// "sin(1.0)" above.
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+// putchard - putchar that takes a double and return 0.
+extern "C" DLLEXPORT double putchard(double x) {
+  fputc((char)x, stderr);
+  return 0;
+}
+
+// printd - printf that takes a double prints it as "%f\n".
+extern "C" DLLEXPORT double printd(double x) {
+  fprintf(stderr, "%f\n", x);
+  return 0;
+}
+
+//===----------------------------------------------------------------------===//
+// Main driver code.
+//===----------------------------------------------------------------------===//
 
 int main() {
   // Prepare the environment to create code for the current native target and

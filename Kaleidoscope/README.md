@@ -209,3 +209,68 @@ ready> ready> ^D
 source_filename = "JIT"
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 ```
+
+## Extending the Language: Control Flow
+
+Unfortunately, as presented, Kaleidoscope is mostly useless: it has no control flow other than call and return. This means that you can't have conditional branches in the code, significantly limiting its power. In this episode of "build that compiler", we'll extend Kaleidoscope to have an if/then/else expression plus a simple 'for' loop.
+
+```LLVM
+ready> extern foo();
+ready> Read extern:
+declare double @foo()
+
+ready> extern bar();
+ready> Read extern:
+declare double @bar()
+
+ready> def baz(x) if x then foo() else bar();
+ready> Read function definition:
+define double @baz(double %x) {
+entry:
+  %ifcond = fcmp ueq double %x, 0.000000e+00
+  br i1 %ifcond, label %else, label %then
+
+then:                                             ; preds = %entry
+  %CallTemp = call double @foo()
+  br label %ifcont
+
+else:                                             ; preds = %entry
+  %CallTemp1 = call double @bar()
+  br label %ifcont
+
+ifcont:                                           ; preds = %else, %then
+  %IfTemp = phi double [ %CallTemp, %then ], [ %CallTemp1, %else ]
+  ret double %IfTemp
+}
+```
+
+Now that we know how to add basic control flow constructs to the language, we have the tools to add more powerful things. Let’s add something more aggressive, a ‘for’ expression:
+
+```llvm
+ready> extern bar(x);
+ready> Read extern:
+declare double @bar(double)
+
+ready> def baz(n)
+ready>   for i = 1, i < n, 1.0 in bar(i);
+Read function definition:
+define double @baz(double %n) {
+entry:
+  br label %Loop
+
+Loop:                                             ; preds = %Loop, %entry
+  %i = phi double [ 1.000000e+00, %entry ], [ %nextval, %Loop ]
+  %CallTemp = call double @bar(double %i)
+  %nextval = fadd double %i, 1.000000e+00
+  %CMPTemp = fcmp ult double %i, %n
+  br i1 %CMPTemp, label %Loop, label %afterloop
+
+afterloop:                                        ; preds = %Loop
+  ret double 0.000000e+00
+}
+
+ready> ^D
+ready> ; ModuleID = 'JIT'
+source_filename = "JIT"
+target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
+```
