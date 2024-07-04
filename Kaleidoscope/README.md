@@ -274,3 +274,155 @@ ready> ; ModuleID = 'JIT'
 source_filename = "JIT"
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-i64:64-f80:128-n8:16:32:64-S128"
 ```
+
+## Extending the Language: User-defined Operators
+
+At this point in our tutorial, we now have a fully functional language that is fairly minimal, but also useful. There is still one big problem with it, however. Our language doesn’t have many useful operators (like division, logical negation, or even any comparisons besides less-than).
+
+This chapter of the tutorial takes a wild digression into adding user-defined operators to the simple and beautiful Kaleidoscope language.
+
+First, add unary operators, like logical operator not.
+
+```llvm
+ready> def unary!(v) if v then 0 else 1;
+ready> Read function definition:
+define double @"unary!"(double %v) {
+entry:
+  %ifcond = fcmp ueq double %v, 0.000000e+00
+  %. = select i1 %ifcond, double 1.000000e+00, double 0.000000e+00
+  ret double %.
+}
+
+ready> !(5);
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  %unop = call double @"unary!"(double 5.000000e+00)
+  ret double %unop
+}
+
+Evaluated to 0.000000
+ready> !(0);
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  %unop = call double @"unary!"(double 0.000000e+00)
+  ret double %unop
+}
+
+Evaluated to 1.000000
+```
+
+And, also the binary operator, but noticed that, binary operator involve precedence issues. Here we define binary operator and precedence together.
+
+```llvm
+ready> def binary> 10 (LHS RHS) RHS < LHS;
+ready> Read function definition:
+define double @"binary>"(double %LHS, double %RHS) {
+entry:
+  %CMPTemp = fcmp ult double %RHS, %LHS
+  %BoolTemp = uitofp i1 %CMPTemp to double
+  ret double %BoolTemp
+}
+
+ready> 1 < 0;
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  ret double 0.000000e+00
+}
+
+Evaluated to 0.000000
+ready> 0 < 1;
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  ret double 1.000000e+00
+}
+
+Evaluated to 1.000000
+```
+
+```llvm
+ready> def binary| 5 (LHS RHS) if LHS then 1 else if RHS then 1 else 0;
+ready> Read function definition:
+define double @"binary|"(double %LHS, double %RHS) {
+entry:
+  %ifcond = fcmp ueq double %LHS, 0.000000e+00
+  %ifcond1 = fcmp ueq double %RHS, 0.000000e+00
+  %. = select i1 %ifcond1, double 0.000000e+00, double 1.000000e+00
+  %IfTemp5 = select i1 %ifcond, double %., double 1.000000e+00
+  ret double %IfTemp5
+}
+
+ready> 1 | 0;
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  %binop = call double @"binary|"(double 1.000000e+00, double 0.000000e+00)
+  ret double %binop
+}
+
+Evaluated to 1.000000
+ready> 0 | 1;
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  %binop = call double @"binary|"(double 0.000000e+00, double 1.000000e+00)
+  ret double %binop
+}
+
+Evaluated to 1.000000
+ready> 0 | 0;
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  %binop = call double @"binary|"(double 0.000000e+00, double 0.000000e+00)
+  ret double %binop
+}
+
+Evaluated to 0.000000
+```
+
+Other operator can be define like above.
+
+```text
+# Logical unary not.
+def unary!(v)
+  if v then
+    0
+  else
+    1;
+
+# Unary negate.
+def unary-(v)
+  0-v;
+
+# Define > with the same precedence as <.
+def binary> 10 (LHS RHS)
+  RHS < LHS;
+
+# Binary logical or, which does not short circuit.
+def binary| 5 (LHS RHS)
+  if LHS then
+    1
+  else if RHS then
+    1
+  else
+    0;
+
+# Binary logical and, which does not short circuit.
+def binary& 6 (LHS RHS)
+  if !LHS then
+    0
+  else
+    !!RHS;
+
+# Define = with slightly lower precedence than relationals.
+def binary = 9 (LHS RHS)
+  !(LHS < RHS | LHS > RHS);
+
+# Define ':' for sequencing: as a low-precedence operator that ignores operands
+# and just returns the RHS.
+def binary : 1 (x y) y;
+```

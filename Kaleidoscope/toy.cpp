@@ -1,6 +1,6 @@
 #include "./KaleidoscopeJIT.h"
+#include <cassert>
 #include <cctype>
-#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -74,6 +74,10 @@ enum Token {
 
   tok_for = -9,
   tok_in = -10,
+
+  // operators
+  tok_binary = -11,
+  tok_unary = -12,
 };
 
 static std::string IdentifierStr; // Filled in if tok_identifier.
@@ -116,6 +120,12 @@ static int gettok() {
     }
     if (IdentifierStr == "in") {
       return tok_in;
+    }
+    if (IdentifierStr == "binary") {
+      return tok_binary;
+    }
+    if (IdentifierStr == "unary") {
+      return tok_unary;
     }
     return tok_identifier;
   }
@@ -263,6 +273,18 @@ private:
   std::unique_ptr<ExprAST> Body;
 };
 
+// UnaryExprAST - Expresson class for a unary operator.
+class UnaryExprAST : public ExprAST {
+public:
+  UnaryExprAST(char Opcode, std::unique_ptr<ExprAST> Operand)
+      : Opcode(Opcode), Operand(std::move(Operand)) {}
+  llvm::Value *codegen() override;
+
+private:
+  char Opcode;
+  std::unique_ptr<ExprAST> Operand;
+};
+
 // For our basic language, these are all of the expression nodes we'll define.
 // Because it doesn't have conditional control flow, it isn't Turing-complete;
 // we'll fix that in a later installment.
@@ -278,14 +300,28 @@ private:
 // realistic language, the "ExprAST" class would probably have a type field.
 class PrototypeAST {
 public:
-  PrototypeAST(const std::string &Name, std::vector<std::string> Args)
-      : Name(Name), Args(std::move(Args)) {}
+  PrototypeAST(const std::string &Name, std::vector<std::string> Args,
+               bool IsOperator = false, unsigned Prec = 0)
+      : Name(Name), Args(std::move(Args)), IsOperator(IsOperator),
+        Precedence(Prec) {}
   llvm::Function *codegen();
   const std::string &getName() const { return Name; }
+
+  bool isUnaryOp() const { return IsOperator && Args.size() == 1; }
+  bool isBinaryOp() const { return IsOperator && Args.size() == 2; }
+
+  char getOperatorName() const {
+    assert(isUnaryOp() || isBinaryOp());
+    return Name[Name.size() - 1];
+  }
+
+  unsigned getBinaryPrecedence() const { return Precedence; }
 
 private:
   std::string Name;
   std::vector<std::string> Args;
+  bool IsOperator;
+  unsigned Precedence; // Precedence if a binary op.
 };
 
 // FunctionAST - This class represents a function definition itself.
@@ -445,6 +481,7 @@ static std::unique_ptr<ExprAST> ParsePrimary() {
 
 static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
                                               std::unique_ptr<ExprAST> LHS);
+static std::unique_ptr<ExprAST> ParseUnary();
 
 // BinopPrecedence - This holds the precedence for each binary operator.
 static std::map<char, int> BinopPrecedence;
@@ -488,8 +525,10 @@ static void InitTokPrecedence() {
 //
 // expression
 //   ::= primary binoprhs
+//   ::= unary binoprhs
 static std::unique_ptr<ExprAST> ParseExpression() {
-  auto LHS = ParsePrimary();
+  auto LHS = ParseUnary();
+  // auto LHS = ParsePrimary();
   if (!LHS) {
     return nullptr;
   }
@@ -522,7 +561,9 @@ static std::unique_ptr<ExprAST> ParseBinOpRHS(int ExprPrec,
     int BinOp = CurTok;
     getNextToken(); // eat binop
 
-    auto RHS = ParsePrimary();
+    // auto RHS = ParsePrimary();
+    // Parse the unary expression after the binary operator.
+    auto RHS = ParseUnary();
     if (!RHS) {
       return nullptr;
     }
@@ -649,19 +690,78 @@ static std::unique_ptr<ExprAST> ParseForExpr() {
                                       std::move(Step), std::move(Body));
 }
 
+// unary
+//   ::= primary
+//   :: '!' unary
+static std::unique_ptr<ExprAST> ParseUnary() {
+  // If the current token is an operator, it must be a primary expr.
+  if (!isascii(CurTok) || CurTok == '(' || CurTok == '.') {
+    return ParsePrimary();
+  }
+
+  // If this is a unary operator, read it.
+  int Opc = CurTok;
+  getNextToken();
+  if (auto Operand = ParseUnary()) {
+    return std::make_unique<UnaryExprAST>(Opc, std::move(Operand));
+  }
+
+  return nullptr;
+}
+
 // The next thing missing is handling of function prototypes. In Kaleidoscope,
 // these are used both for 'extern' function declarations as well as function
 // body definitions.
 //
 // prototype
 //   ::= id '(' id* ')'
+//   ::= binary LETTER number? (id, id)
+//   ::= unary LETTER (id)
 static std::unique_ptr<PrototypeAST> ParsePrototype() {
-  if (CurTok != tok_identifier) {
-    return LogErrorP("Expected function name in prototype");
+  std::string FnName;
+
+  unsigned Kind = 0; // 0 = identifier, 1 = unary, 2 = binary
+  unsigned BinaryPrecedence = 30;
+
+  switch (CurTok) {
+  case tok_identifier:
+    FnName = IdentifierStr;
+    Kind = 0;
+    getNextToken();
+    break;
+  case tok_unary:
+    getNextToken();
+    if (!isascii(CurTok)) {
+      return LogErrorP("Expected unary operator");
+    }
+    FnName = "unary";
+    FnName += (char)CurTok;
+    Kind = 1;
+    getNextToken();
+    break;
+  case tok_binary:
+    getNextToken();
+    if (!isascii(CurTok)) {
+      return LogErrorP("Expected binary operator.");
+    }
+    FnName = "binary";
+    FnName += (char)CurTok;
+    Kind = 2;
+    getNextToken();
+
+    // Read the precedence if present
+    if (CurTok == tok_number) {
+      if (NumVal < 1 || NumVal > 100) {
+        return LogErrorP("Invalid precedence: must be 1..100");
+      }
+      BinaryPrecedence = (unsigned)NumVal;
+      getNextToken();
+    }
+    break;
+  default:
+    return LogErrorP("Except function name in prototype.");
   }
 
-  std::string FnName = IdentifierStr;
-  getNextToken(); // eat '('
   if (CurTok != '(') {
     return LogErrorP("Expected '(' in prototype");
   }
@@ -676,7 +776,13 @@ static std::unique_ptr<PrototypeAST> ParsePrototype() {
   }
   getNextToken(); // eat ')'
 
-  return std::make_unique<PrototypeAST>(FnName, std::move(ArgNames));
+  // Verify right number of names for operator
+  if (Kind && ArgNames.size() != Kind) {
+    return LogErrorP("Invalid number of operands for operator");
+  }
+
+  return std::make_unique<PrototypeAST>(FnName, std::move(ArgNames), Kind != 0,
+                                        BinaryPrecedence);
 }
 
 // Function definition is very simple, just a prototype plus an expression to
@@ -990,8 +1096,31 @@ llvm::Value *BinaryExprAST::codegen() {
     return Builder->CreateUIToFP(L, llvm::Type::getDoubleTy(*TheContext),
                                  "BoolTemp");
   default:
-    return LogErrorV("Invalid Binary Operator.");
+    break;
+    // return LogErrorV("Invalid Binary Operator.");
   }
+
+  // If it wasn't a builtin binary operator, it must be a user defined one.
+  // Emit a call to it.
+  llvm::Function *F = getFunction(std::string("binary") + Op);
+  assert(F && "binary operator not found!");
+
+  llvm::Value *Ops[2] = {L, R};
+  return Builder->CreateCall(F, Ops, "binop");
+}
+
+llvm::Value *UnaryExprAST::codegen() {
+  llvm::Value *OperandV = Operand->codegen();
+  if (!OperandV) {
+    return nullptr;
+  }
+
+  llvm::Function *F = getFunction(std::string("unary") + Opcode);
+  if (!F) {
+    return LogErrorV("Unknow unary operator");
+  }
+
+  return Builder->CreateCall(F, OperandV, "unop");
 }
 
 // Code generation for function calls is quite straightforward with LLVM. The
@@ -1095,6 +1224,11 @@ llvm::Function *FunctionAST::codegen() {
   llvm::Function *TheFunction = getFunction(P.getName());
   if (!TheFunction) {
     return nullptr;
+  }
+
+  // If this is an operator, install it.
+  if (P.isBinaryOp()) {
+    BinopPrecedence[P.getOperatorName()] = P.getBinaryPrecedence();
   }
 
   // Create a new basic block to start insertion into.
