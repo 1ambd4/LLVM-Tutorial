@@ -426,3 +426,163 @@ def binary = 9 (LHS RHS)
 # and just returns the RHS.
 def binary : 1 (x y) y;
 ```
+
+## Extending the Language: Mutable Variables
+
+In this chapter, we introduce mutable variables into Kaleidoscope. Noticed that it not simple, LLVM require all register values to be in SSA form, but look example of mutable variable:
+
+```c
+int G, H;
+int test(_Bool Condition) {
+  int X;
+  if (Condition)
+    X = G;
+  else
+    X = H;
+  return X;
+}
+```
+
+The LLVM IR that we want for this example looks like this:
+
+```llvm
+@G = weak global i32 0   ; type of @G is i32*
+@H = weak global i32 0   ; type of @H is i32*
+
+define i32 @test(i1 %Condition) {
+entry:
+  br i1 %Condition, label %cond_true, label %cond_false
+
+cond_true:
+  %X.0 = load i32, i32* @G
+  br label %cond_next
+
+cond_false:
+  %X.1 = load i32, i32* @H
+  br label %cond_next
+
+cond_next:
+  %X.2 = phi i32 [ %X.1, %cond_false ], [ %X.0, %cond_true ]
+  ret i32 %X.2
+}
+```
+
+We use PHI node to merge the incoming value form different branch. The question is "who places the PHI node when lowering assignments to mutable variables?". The issue here is that LLVM requires that its IR be in SSA form: there is no "non-ssa" mode for it.
+
+The trick here is that while LLVM does require all register values to be in SSA form, it does not require (or permit) memory objects to be in SSA form.
+
+With this in mind, the high-level idea is that we want to make a stack variable (which lives in memory, because it is on the stack) for each mutable object in a function.
+
+Now, we could rewrite the example to use the alloca technique to avoid using a PHI node.
+
+```llvm
+@G = weak global i32 0   ; type of @G is i32*
+@H = weak global i32 0   ; type of @H is i32*
+
+define i32 @test(i1 %Condition) {
+entry:
+  %X = alloca i32           ; type of %X is i32*.
+  br i1 %Condition, label %cond_true, label %cond_false
+
+cond_true:
+  %X.0 = load i32, i32* @G
+  store i32 %X.0, i32* %X   ; Update X
+  br label %cond_next
+
+cond_false:
+  %X.1 = load i32, i32* @H
+  store i32 %X.1, i32* %X   ; Update X
+  br label %cond_next
+
+cond_next:
+  %X.2 = load i32, i32* %X  ; Read X
+  ret i32 %X.2
+}
+```
+
+With this, we have discovered a way to handle arbitrary mutable variables without the need to create Phi nodes at all:
+
+1. Each mutable variable becomes a stack allocation.
+2. Each read of the variable becomes a load from the stack.
+3. Each update of the variable becomes a store to the stack.
+4. Tacking the address of a variale just use the stack address directly.
+
+While this solution has solved our immediate problem, it introduced another one: we have now apparently introduced a lot of stack traffic for very simple and common operations, a major performance problem. Fortunately for us, the LLVM optimizer has a highly-tuned optimization pass named "mem2reg" that handles this case, promoting allocas like this into SSA registers, inserting Phi nodes as appropriate. If you run this example through the pass, for example, you'll get:
+
+```llvm
+$ llvm-as < example.ll | opt -passes=mem2reg | llvm-dis
+@G = weak global i32 0
+@H = weak global i32 0
+
+define i32 @test(i1 %Condition) {
+entry:
+  br i1 %Condition, label %cond_true, label %cond_false
+
+cond_true:
+  %X.0 = load i32, i32* @G
+  br label %cond_next
+
+cond_false:
+  %X.1 = load i32, i32* @H
+  br label %cond_next
+
+cond_next:
+  %X.01 = phi i32 [ %X.1, %cond_false ], [ %X.0, %cond_true ]
+  ret i32 %X.01
+}
+```
+
+## Extending the Language: Mutable Variables
+
+While Kaleidoscope is interesting as a functional language, this chapter will extend the language with mutable variables.
+
+```llvm
+ready> extern printd(x);
+ready> Read extern:
+declare double @printd(double)
+
+ready> def binary : 1 (x y) y;
+ready> Read function definition:
+define double @"binary:"(double %x, double %y) {
+entry:
+  ret double %y
+}
+
+ready> def test(x) printd(x) : x = 4: printd(x);
+ready> Read function definition:
+define double @test(double %x) {
+entry:
+  %CallTemp = call double @printd(double %x)
+  %binop = call double @"binary:"(double %CallTemp, double 4.000000e+00)
+  %CallTemp4 = call double @printd(double 4.000000e+00)
+  %binop5 = call double @"binary:"(double %binop, double %CallTemp4)
+  ret double %binop5
+}
+
+ready> test(123);
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  %CallTemp = call double @test(double 1.230000e+02)
+  ret double %CallTemp
+}
+
+123.000000
+4.000000
+Evaluated to 0.000000
+```
+
+When run, this example prints "123" and then "4", showing that we did catually mutate the value!
+
+Alse we support user-defined local variable by keyword var.
+
+```llvm
+ready> var a = 2024 in 1;
+ready> Read top level expression:
+define double @__anon_expr() {
+entry:
+  ret double 1.000000e+00
+}
+
+Evaluated to 1.000000
+```
