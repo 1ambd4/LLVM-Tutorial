@@ -586,3 +586,52 @@ entry:
 
 Evaluated to 1.000000
 ```
+
+## Compiling to Object Code
+
+Notice that, it seems JIT need to be disable.
+
+We can emit object file, when enter CTRL-D, will find it emit.
+
+```llvm
+ready> def average(x y) (x+y) * 0.5;
+ready> Read function definition:
+define double @average(double %x, double %y) {
+entry:
+  %y2 = alloca double, align 8
+  %x1 = alloca double, align 8
+  store double %x, ptr %x1, align 8
+  store double %y, ptr %y2, align 8
+  %x3 = load double, ptr %x1, align 8
+  %y4 = load double, ptr %y2, align 8
+  %AddTemp = fadd double %x3, %y4
+  %MulTemp = fmul double %AddTemp, 5.000000e-01
+  ret double %MulTemp
+}
+
+ready> ready> Wrote: output.o
+```
+
+Then write code in C++:
+
+```cpp
+// main.cpp
+#include <iostream>
+
+extern "C" {
+double average(double, double);
+}
+
+int main() {
+  std::cout << average(3, 4) << std::endl;
+  return 0;
+}
+```
+
+And compile lie this:
+
+```bash
+clang++ main.cpp output.o -o main
+```
+
+If run `./main`, we will see the result of 3.5. How amazing!!!

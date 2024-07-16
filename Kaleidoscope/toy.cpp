@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <llvm-c/TargetMachine.h>
 #include <llvm/ADT/APFloat.h>
 #include <llvm/ADT/StringRef.h>
 #include <llvm/Analysis/CGSCCPassManager.h>
@@ -20,17 +21,23 @@
 #include <llvm/IR/IRBuilder.h>
 #include <llvm/IR/Instructions.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/PassInstrumentation.h>
 #include <llvm/IR/PassManager.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IR/Value.h>
 #include <llvm/IR/Verifier.h>
+#include <llvm/MC/TargetRegistry.h>
 #include <llvm/Passes/PassBuilder.h>
 #include <llvm/Passes/StandardInstrumentations.h>
+#include <llvm/Support/CodeGen.h>
 #include <llvm/Support/Error.h>
+#include <llvm/Support/FileSystem.h>
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/Support/raw_ostream.h>
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/Target/TargetOptions.h>
 #include <llvm/Transforms/InstCombine/InstCombine.h>
 #include <llvm/Transforms/Scalar/GVN.h>
 #include <llvm/Transforms/Scalar/Reassociate.h>
@@ -39,6 +46,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -1440,7 +1448,7 @@ llvm::Function *FunctionAST::codegen() {
     // Optimize the function.
     // The FunctionPassManager optimizes and updates the LLVM Function* in
     // place, improving (hopefully) its body.
-    TheFPM->run(*TheFunction, *TheFAM);
+    // TheFPM->run(*TheFunction, *TheFAM);
 
     return TheFunction;
   }
@@ -1476,6 +1484,16 @@ llvm::Function *FunctionAST::codegen() {
 // Top-Level parsing and JIT Driver
 //===----------------------------------------------------------------------===//
 
+static void InitializeModuleAndPassManger() {
+  // Open a new module
+  TheContext = std::make_unique<llvm::LLVMContext>();
+  TheModule = std::make_unique<llvm::Module>("JIT", *TheContext);
+
+  // Create a new builder for the module.
+  Builder = std::make_unique<llvm::IRBuilder<>>(*TheContext);
+}
+
+// This function not used now.
 static void InitializeModuleAndMangers() {
   // Open a new context and module.
   TheContext = std::make_unique<llvm::LLVMContext>();
@@ -1531,9 +1549,6 @@ static void HandleDefinition() {
       fprintf(stderr, "Read function definition:\n");
       FnIR->print(llvm::errs());
       fprintf(stderr, "\n");
-      ExitOnErr(TheJIT->addModule(llvm::orc::ThreadSafeModule(
-          std::move(TheModule), std::move(TheContext))));
-      InitializeModuleAndMangers();
     }
   } else {
     // Skip token for error recovery.
@@ -1675,16 +1690,76 @@ int main() {
   fprintf(stderr, "ready> ");
   getNextToken();
 
-  TheJIT = ExitOnErr(llvm::orc::KaleidoscopeJIT::Create());
+  // Disable JIT.
+  // TheJIT = ExitOnErr(llvm::orc::KaleidoscopeJIT::Create());
 
   // Make the module, which holds all the code.
-  InitializeModuleAndMangers();
+  // InitializeModuleAndMangers();
+  InitializeModuleAndPassManger();
 
   // Run the main "interpreter loop" now.
   MainLoop();
 
   // Print out all of the generated code.
-  TheModule->print(llvm::errs(), nullptr);
+  // TheModule->print(llvm::errs(), nullptr);
+
+  // Initialize the target registry etc.
+  llvm::InitializeAllTargetInfos();
+  llvm::InitializeAllTargets();
+  llvm::InitializeAllTargetMCs();
+  llvm::InitializeAllAsmParsers();
+  llvm::InitializeAllAsmPrinters();
+
+  // target triple: <arch><sub>-<vendor>-<sys>-<abi>
+  // like: x86_64-pc-linux-gnu
+  auto TargetTriple = LLVMGetDefaultTargetTriple();
+  TheModule->setTargetTriple(TargetTriple);
+
+  std::string Error;
+  auto Target = llvm::TargetRegistry::lookupTarget(TargetTriple, Error);
+
+  // Print an error and exit if we couldn't find the request target.
+  // This generally occurs if we have forgotten to initialise the TargetRegistry
+  // or we have a bogus target triple.
+  if (!Target) {
+    llvm::errs() << Error;
+    return 1;
+  }
+
+  auto CPU = "generic";
+  auto Features = "";
+
+  llvm::TargetOptions opt;
+  auto TheTargetMachine = Target->createTargetMachine(
+      TargetTriple, CPU, Features, opt, llvm::Reloc::PIC_);
+
+  TheModule->setDataLayout(TheTargetMachine->createDataLayout());
+  TheModule->setTargetTriple(TargetTriple);
+
+  // We're ready to emit object code, now define where to write file to.
+  auto FileName = "output.o";
+  std::error_code EC;
+  llvm::raw_fd_ostream dest(FileName, EC, llvm::sys::fs::OF_None);
+
+  if (EC) {
+    llvm::errs() << "Could not open file: " << EC.message();
+    return -1;
+  }
+
+  // #include <llvm/IR/LegacyPassManager.h>
+  // Finally, define a pass that emits object code, then run the pass.
+  llvm::legacy::PassManager pass;
+  auto FileType = llvm::CGFT_ObjectFile;
+
+  if (TheTargetMachine->addPassesToEmitFile(pass, dest, nullptr, FileType)) {
+    llvm::errs() << "The TargetMachine can't emit a file of this type.";
+    return 1;
+  }
+
+  pass.run(*TheModule);
+  dest.flush();
+
+  llvm::outs() << "Wrote: " << FileName << "\n";
 
   return 0;
 }
